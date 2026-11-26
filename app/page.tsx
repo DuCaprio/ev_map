@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useContext } from 'react';
+import React, { Suspense, useState, useEffect, useContext } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import KakaoMap from '../components/map/Kakao';
 import SearchBar from '../components/charger/SearchBar';
@@ -16,6 +16,14 @@ import { getStatLabel } from '../types/charger';
 import { useTranslation } from '../hooks/useTranslation';
 
 export default function Home() {
+  return (
+    <Suspense>
+      <HomeContent />
+    </Suspense>
+  );
+}
+
+function HomeContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
 

@@ -31,6 +31,13 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 
 ## Deploy on Vercel
 
+For Vercel Hobby, the app uses Supabase Cron for the five-minute charger status refresh.
+
+1. Deploy the Next.js app with its production environment variables, including `CRON_SECRET`. Keep `.env.local` out of Git.
+2. In Supabase Vault, set `charger_sync_url` to the production URL followed by `/api/cron/chargers`. Set `charger_sync_secret` to the same value as Vercel's `CRON_SECRET`.
+3. Run [06_charger_sync_schedule.sql](supabase/06_charger_sync_schedule.sql) in the Supabase SQL Editor.
+4. After the next scheduled run, check `select id, status_code, timed_out from net._http_response order by id desc limit 5;` in the SQL Editor. The refresh endpoint should return HTTP 200.
+
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.

@@ -20,6 +20,7 @@ export async function GET() {
       const { data, error } = await supabase
         .from('charger_status')
         .select('id, stat')
+        .order('id')
         .range(start, start + limit - 1);
 
       if (error) throw error;

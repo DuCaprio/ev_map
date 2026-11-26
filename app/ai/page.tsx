@@ -24,7 +24,7 @@ type UiMessage = {
   isError?: boolean;
   stations?: ChargerWithDist[];
   stationsOnly?: boolean;
-  stationLabel?: string; // 충전소 목록 헤더 커스텀 텍스트
+  stationLabel?: string;
 };
 
 // 빠른 질문 칩 목록
@@ -35,47 +35,6 @@ const QUICK_QUESTIONS = [
   '충전 중 다른 곳에 가도 되나요?',
 ];
 
-// 충전소 위치 검색 의도 키워드 (위치 정보 있을 때만 감지)
-const STATION_SEARCH_KEYWORDS = [
-  '충전소', '충전기', '근처', '가까운', '주변', '찾아줘', '어디', '추천',
-  '알려줘', '어디야', '있어', '찾아', '위치',
-];
-
-function isStationSearchIntent(text: string): boolean {
-  const lower = text.toLowerCase();
-  const matched = STATION_SEARCH_KEYWORDS.filter((kw) => lower.includes(kw));
-  return matched.length >= 2;
-}
-
-// 텍스트에서 장소명 추출 (정규식, 0토큰)
-// 예: "제주시청 근처 충전소" → "제주시청"
-function extractPlaceName(text: string): string | null {
-  // 동작 동사/접미어 제거
-  const cleaned = text
-    .replace(/추천해줘|알려줘|찾아줘|추천해주세요|알려주세요|찾아주세요|해줘|해주세요/g, '')
-    .trim();
-
-  const patterns = [
-    // "장소명 근처|주변|앞|에서" — 명확한 공간 분리자만 사용 (짧은 조사 제외)
-    /^(.+?)\s+(?:근처|주변|앞|에서|부근)/,
-    // "장소명 충전소|충전기" — 충전 관련 단어 바로 앞
-    /^(.+?)\s+(?:충전소|충전기)/,
-  ];
-
-  for (const pattern of patterns) {
-    const match = cleaned.match(pattern);
-    const candidate = match?.[1]?.trim();
-    if (
-      candidate &&
-      candidate.length >= 2 &&
-      !/^(충전소|충전기|근처|주변|가까운|추천|알려)$/.test(candidate)
-    ) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
 // ─── 컴포넌트 ──────────────────────────────────────────────
 
 export default function AiPage() {
@@ -83,29 +42,24 @@ export default function AiPage() {
     {
       id: '1',
       role: 'ai',
-      text: '위치 기반 버튼을 누르면 근처 충전소를 바로 찾아드립니다 !',
+      text: '무엇을 도와드릴까요?',
     },
   ]);
 
   const [apiHistory, setApiHistory] = useState<ApiMessage[]>([]);
-  const [nearestContext, setNearestContext] = useState<ChargerWithDist[]>([]);
+  const [location, setLocation] = useState<{ lat: number; lng: number }>();
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isLocating, setIsLocating] = useState(false);
-  // 빠른 질문 칩을 한 번 사용하면 숨김
   const [showQuickChips, setShowQuickChips] = useState(true);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
   useEffect(() => {
-    scrollToBottom();
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // ─── 위치 기반 충전소 조회 ─────────────────────────────────
+  // ─── 위치 기반 충전소 조회 (GPS 버튼) ─────────────────────
 
   const handleGetLocation = () => {
     setIsLocating(true);
@@ -119,7 +73,6 @@ export default function AiPage() {
       async (position) => {
         const { latitude, longitude } = position.coords;
         try {
-          // 반경 3km, 최대 10개 — 서버에서 필터링
           const res = await fetch(
             `/api/nearby?lat=${latitude}&lng=${longitude}&radius=3.0&limit=10`
           );
@@ -127,7 +80,7 @@ export default function AiPage() {
           const data = await res.json();
           const top10: ChargerWithDist[] = data.stations ?? [];
 
-          setNearestContext(top10);
+          setLocation({ lat: latitude, lng: longitude });
           setShowQuickChips(false);
 
           setMessages((prev) => [
@@ -171,7 +124,7 @@ export default function AiPage() {
 
   // ─── AI 응답 요청 ──────────────────────────────────────────
 
-  const fetchAIResponse = async (userMessage: string, context: ChargerWithDist[]) => {
+  const fetchAIResponse = async (userMessage: string) => {
     setIsLoading(true);
     try {
       const response = await fetch('/api/chat', {
@@ -179,21 +132,42 @@ export default function AiPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: userMessage,
-          context,
           history: apiHistory,
+          location,
         }),
       });
 
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? 'AI 응답 오류');
 
-      const aiReply: string = data.reply;
+      const aiReply: string = data.reply ?? '';
+      const stations: ChargerWithDist[] | undefined = data.stations;
+      const stationLabel: string | undefined = data.stationLabel;
 
-      setMessages((prev) => [
-        ...prev,
-        { id: (Date.now() + 1).toString(), role: 'ai', text: aiReply },
-      ]);
+      // 텍스트 답변이 있으면 버블로 표시
+      if (aiReply) {
+        setMessages((prev) => [
+          ...prev,
+          { id: (Date.now() + 1).toString(), role: 'ai', text: aiReply },
+        ]);
+      }
 
+      // 충전소 목록이 있으면 카드로 표시 (GPS 버튼과 동일한 UI)
+      if (stations && stations.length > 0) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: (Date.now() + 2).toString(),
+            role: 'ai',
+            text: '',
+            stations,
+            stationsOnly: true,
+            stationLabel,
+          },
+        ]);
+      }
+
+      // 대화 기록에 추가 (텍스트 내용만 추적)
       setApiHistory((prev) => [
         ...prev,
         { role: 'user', parts: [{ text: userMessage }] },
@@ -208,6 +182,7 @@ export default function AiPage() {
   };
 
   // ─── 메시지 전송 ───────────────────────────────────────────
+  // 모든 메시지는 /api/chat으로 전달. 분기 로직 없음.
 
   const handleSend = async (overrideText?: string) => {
     const userMessage = (overrideText ?? input).trim();
@@ -215,64 +190,10 @@ export default function AiPage() {
     setInput('');
     setShowQuickChips(false);
     addUserMessage(userMessage);
-
-    if (isStationSearchIntent(userMessage)) {
-      const placeName = extractPlaceName(userMessage);
-
-      // ① 장소명이 추출됐으면 → jeju_stations.json 텍스트 검색 (외부 API 불필요)
-      if (placeName) {
-        setIsLoading(true);
-        try {
-          const searchRes = await fetch(
-            `/api/search?q=${encodeURIComponent(placeName)}&limit=10`
-          );
-          const searchData = await searchRes.json();
-
-          if (searchData.matched) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: (Date.now() + 1).toString(),
-                role: 'ai',
-                text: '',
-                stations: searchData.stations,
-                stationsOnly: true,
-                stationLabel: `📍 "${placeName}" 관련 충전소`,
-              },
-            ]);
-            setIsLoading(false);
-            return;
-          }
-        } catch {
-          // 검색 실패 시 아래 fallback으로
-        } finally {
-          setIsLoading(false);
-        }
-      }
-
-      // ② 장소명 추출 실패 OR 검색 결과 없음 + GPS context 있으면 → 기존 위치 카드 재표시
-      if (nearestContext.length > 0) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: (Date.now() + 1).toString(),
-            role: 'ai',
-            text: '',
-            stations: nearestContext,
-            stationsOnly: true,
-            stationLabel: '📍 현재 위치 기반 충전소',
-          },
-        ]);
-        return;
-      }
-    }
-
-    // ③ 최종 fallback: AI 응답
-    await fetchAIResponse(userMessage, nearestContext);
+    await fetchAIResponse(userMessage);
   };
 
   // ─── 렌더링 ────────────────────────────────────────────────
-
 
   return (
     <div className="bg-white rounded-[15px] shadow-[0_2px_15px_rgba(0,0,0,0.05)] border border-gray-100/80 flex-1 min-h-[500px] flex flex-col overflow-hidden relative">
@@ -286,10 +207,8 @@ export default function AiPage() {
             </svg>
           </div>
           <div>
-            <h2 className="font-bold text-gray-800 text-[15px]">EV 충전 AI</h2>
-            <p className="text-[11px] text-teal-500 font-medium">
-              Gemini · {apiHistory.length / 2}번 대화
-            </p>
+            <h2 className="font-bold text-gray-800 text-[15px]">EV Chat</h2>
+            <p className="text-[11px] text-teal-500 font-medium">GPT</p>
           </div>
         </div>
 
@@ -315,7 +234,7 @@ export default function AiPage() {
         {messages.map((msg) => (
           <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
 
-            {/* stationsOnly: 카드 목록만 */}
+            {/* stationsOnly: 카드 목록 */}
             {msg.stationsOnly ? (
               <div className="w-full flex flex-col gap-2">
                 <h4 className="font-bold text-[12px] text-teal-600 mb-1 px-1">
@@ -330,7 +249,9 @@ export default function AiPage() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-0.5">
                           <span className="font-bold text-[13px] text-gray-800">{idx + 1}. {s.name}</span>
-                          <span className="text-[11px] font-bold text-teal-500 bg-teal-50 px-2 py-0.5 rounded-full shrink-0">{s.distance}km</span>
+                          {s.distance && (
+                            <span className="text-[11px] font-bold text-teal-500 bg-teal-50 px-2 py-0.5 rounded-full shrink-0">{s.distance}km</span>
+                          )}
                         </div>
                         <p className="text-[11px] text-gray-400 truncate">{s.address}</p>
                       </div>
@@ -353,13 +274,12 @@ export default function AiPage() {
             ) : (
               /* 일반 채팅 버블 */
               <div
-                className={`max-w-[80%] rounded-2xl px-4 py-3 text-[14px] leading-relaxed shadow-sm ${
-                  msg.role === 'user'
+                className={`max-w-[80%] rounded-2xl px-4 py-3 text-[14px] leading-relaxed shadow-sm ${msg.role === 'user'
                     ? 'bg-teal-500 text-white rounded-tr-sm'
                     : msg.isError
-                    ? 'bg-red-50 border border-red-200 text-red-700 rounded-tl-sm'
-                    : 'bg-white border border-gray-100 text-gray-700 rounded-tl-sm'
-                }`}
+                      ? 'bg-red-50 border border-red-200 text-red-700 rounded-tl-sm'
+                      : 'bg-white border border-gray-100 text-gray-700 rounded-tl-sm'
+                  }`}
               >
                 {msg.role === 'user' ? (
                   <div className="whitespace-pre-wrap">{msg.text}</div>
@@ -367,16 +287,12 @@ export default function AiPage() {
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
-                      // 헤더 → 굵은 텍스트로 다운그레이드 (헤더 사이즈 과도함 방지)
                       h1: ({ children }) => <p className="font-bold text-[14px] text-gray-900 mt-2 mb-1">{children}</p>,
                       h2: ({ children }) => <p className="font-bold text-[14px] text-gray-900 mt-2 mb-1">{children}</p>,
                       h3: ({ children }) => <p className="font-semibold text-[13px] text-gray-800 mt-1.5 mb-0.5">{children}</p>,
-                      // 문단: 마지막은 margin 없음
                       p: ({ children }) => <p className="text-[14px] leading-[1.65] mb-2 last:mb-0">{children}</p>,
-                      // 굵게: teal 색으로 강조
                       strong: ({ children }) => <strong className="font-semibold text-teal-700">{children}</strong>,
                       em: ({ children }) => <em className="italic text-gray-500">{children}</em>,
-                      // 리스트: 컴팩트하게
                       ul: ({ children }) => <ul className="list-none pl-0 mb-2 space-y-1">{children}</ul>,
                       ol: ({ children }) => <ol className="list-decimal pl-4 mb-2 space-y-1">{children}</ol>,
                       li: ({ children }) => (
@@ -395,14 +311,13 @@ export default function AiPage() {
                   >
                     {msg.text}
                   </ReactMarkdown>
-
                 )}
               </div>
             )}
           </div>
         ))}
 
-        {/* 빠른 질문 칩 — 첫 메시지 이후, 아직 대화 없을 때 표시 */}
+        {/* 빠른 질문 칩 */}
         {showQuickChips && !isLoading && (
           <div className="flex flex-wrap gap-2 pt-1">
             {QUICK_QUESTIONS.map((q) => (
@@ -438,7 +353,7 @@ export default function AiPage() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            placeholder="전기차 충전에 대해 무엇이든 물어보세요..."
+            placeholder="장소명을 포함해 질문하거나 충전 관련 무엇이든 물어보세요..."
             disabled={isLoading}
             className="w-full bg-gray-50 border border-gray-200 rounded-xl pl-4 pr-12 py-3 text-[14px] text-gray-700 focus:outline-none focus:ring-2 focus:ring-teal-400/50 focus:border-teal-400 transition-all placeholder:text-gray-400 disabled:opacity-70"
           />

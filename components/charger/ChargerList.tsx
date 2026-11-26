@@ -16,8 +16,9 @@ interface ChargerListProps {
   setChargeFilter: (f: FilterType) => void;
   isFavorite: (id: string) => boolean;
   onToggleFavorite: (charger: Charger) => void;
-  statusFilter: '전체' | '사용가능' | '충전중' | '중지';
-  setStatusFilter: (f: '전체' | '사용가능' | '충전중' | '중지') => void;
+  statusFilter: StatusType;
+  setStatusFilter: (f: StatusType) => void;
+  onSelectCharger: (charger: Charger) => void;
   // 비교 기능
   isInCompare: (id: string) => boolean;
   onToggleCompare: (charger: Charger) => void;
@@ -285,7 +286,7 @@ export default function ChargerList({
 
 type StatusType = '전체' | '사용가능' | '충전중' | '중지' | '점검';
 
-const STATUS_OPTIONS: { value: StatusType; label: string; color: string }[] = [
+const STATUS_OPTIONS: { value: StatusType; labelKo: string; labelEn: string; color: string }[] = [
   { value: '전체', labelKo: '상태', labelEn: 'Status', color: '' },
   { value: '사용가능', labelKo: '사용가능', labelEn: 'Available', color: '#22c55e' },
   { value: '충전중', labelKo: '충전중', labelEn: 'Charging', color: '#3b82f6' },
@@ -365,7 +366,7 @@ function FilterTabs({
   chargeFilter: FilterType; setChargeFilter: (f: FilterType) => void;
   statusFilter: StatusType; setStatusFilter: (f: StatusType) => void;
   zoomState: ZoomState; selectCity: (c: '전체' | '제주시' | '서귀포시') => void; resetToCity: () => void;
-  t: (key: string) => string;
+  t: ReturnType<typeof useTranslation>['t'];
   lang: string;
 }) {
   const currentCity = zoomState.selectedCity === '전체' && zoomState.level === 'city' ? '전체' : zoomState.selectedCity;

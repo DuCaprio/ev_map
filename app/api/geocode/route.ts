@@ -10,28 +10,33 @@ export async function GET(req: Request) {
     return NextResponse.json({ found: false, reason: 'query too short' });
   }
 
-  const kakaoKey = process.env.NEXT_PUBLIC_KAKAO_MAP_KEY;
+  const kakaoKey = process.env.KAKAO_REST_API_KEY;
   if (!kakaoKey) {
     return NextResponse.json({ found: false, reason: 'no kakao key' }, { status: 500 });
   }
 
   try {
-    // 제주도 중심 좌표(33.4, 126.5) 기준 반경 60km 내에서 우선 검색
-    const url = `https://dapi.kakao.com/v2/local/search/keyword.json?query=${encodeURIComponent(query)}&y=33.4&x=126.5&radius=60000&size=1`;
+    // 제주 지역을 포함하는 사각형 범위에서 장소를 검색합니다.
+    const url = `https://dapi.kakao.com/v2/local/search/keyword.json?query=${encodeURIComponent(query)}&rect=126.10,32.95,127.05,33.65&size=1`;
 
     const res = await fetch(url, {
       headers: { Authorization: `KakaoAK ${kakaoKey}` },
+      signal: AbortSignal.timeout(5000),
     });
 
-    if (!res.ok) {
-      // JavaScript 키로 REST API 호출 실패 시 주소 검색으로 fallback
+    const data = res.ok ? await res.json() : null;
+    const doc = data?.documents?.[0];
+
+    if (!doc) {
       const addrUrl = `https://dapi.kakao.com/v2/local/search/address.json?query=${encodeURIComponent(query)}&size=1`;
       const addrRes = await fetch(addrUrl, {
         headers: { Authorization: `KakaoAK ${kakaoKey}` },
+        signal: AbortSignal.timeout(5000),
       });
-      if (!addrRes.ok) return NextResponse.json({ found: false, reason: 'kakao api error' });
+      if (!addrRes.ok) return NextResponse.json({ found: false, reason: 'kakao api error' }, { status: 502 });
       const addrData = await addrRes.json();
       const doc = addrData.documents?.[0];
+      if (!doc && !res.ok) return NextResponse.json({ found: false, reason: 'kakao api error' }, { status: 502 });
       if (!doc) return NextResponse.json({ found: false });
       return NextResponse.json({
         found: true,
@@ -41,11 +46,6 @@ export async function GET(req: Request) {
       });
     }
 
-    const data = await res.json();
-    const doc = data.documents?.[0];
-
-    if (!doc) return NextResponse.json({ found: false, reason: 'no results' });
-
     return NextResponse.json({
       found: true,
       lat: parseFloat(doc.y),
@@ -54,6 +54,6 @@ export async function GET(req: Request) {
     });
   } catch (error) {
     console.error('Geocode error:', error);
-    return NextResponse.json({ found: false, reason: 'exception' });
+    return NextResponse.json({ found: false, reason: 'exception' }, { status: 502 });
   }
 }

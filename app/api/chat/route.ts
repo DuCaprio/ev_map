@@ -1,171 +1,231 @@
+import { createClient } from '@supabase/supabase-js';
 import { NextResponse } from 'next/server';
-import { GoogleGenAI } from '@google/genai';
+import { GET as geocode } from '@/app/api/geocode/route';
+import { GET as nearby } from '@/app/api/nearby/route';
+import { isFastCharger, type Charger } from '@/types/charger';
 
 export const runtime = 'nodejs';
 
-// 충전기 타입 코드 → 한국어 레이블
-const CHARGER_TYPE_LABEL: Record<string, string> = {
-  '01': 'DC차데모(급속)',
-  '02': 'AC완속',
-  '03': 'DC차데모+AC3상(급속)',
-  '04': 'DC콤보(급속)',
-  '05': 'DC콤보+차데모(급속)',
-  '06': 'DC콤보+차데모+AC3상(급속)',
-  '07': '슈퍼차저(급속)',
-};
-
-// 충전기 상태 코드 → 한국어 레이블
-const CHARGER_STAT_LABEL: Record<string, string> = {
-  '1': '통신이상',
-  '2': '사용가능',
-  '3': '충전중',
-  '4': '운영중지',
-  '5': '점검중',
-  '9': '미확인',
-};
-
-// 충전기가 급속인지 여부
-function isFast(type: string): boolean {
-  return ['01', '03', '04', '05', '06', '07'].includes(type);
-}
-
-interface ChargerPort {
-  chgerId: string;
+type Station = Charger & { distance: string };
+type Location = { lat: number; lng: number };
+type Search = { place: string | null; speed: 'any' | 'fast' | 'slow'; availableOnly: boolean };
+type ModelOutput = {
   type: string;
-  stat?: string;
+  name?: string;
+  arguments?: string;
+  content?: { type: string; text?: string; refusal?: string }[];
+};
+
+const RADIUS_KM = 3;
+const MAX_AGE_MS = 15 * 60_000;
+const REQUESTS_PER_MINUTE = 6;
+const DAY_MS = 86_400_000;
+const MINUTE_MS = 60_000;
+const DEFAULT_DAILY_LIMIT = 100;
+let minuteWindow = { start: 0, count: 0 };
+let dayWindow = { start: 0, count: 0 };
+const UNKNOWN_STATUS = '현재 충전기 상태를 확인할 수 없습니다. 잠시 후 다시 조회해 주세요.';
+const lookupTool = {
+  type: 'function',
+  name: 'find_chargers',
+  description: '제주에서 실제 충전소를 찾거나 가용 상태를 묻는 모든 요청을 조회합니다.',
+  strict: true,
+  parameters: {
+    type: 'object',
+    properties: {
+      place: { type: ['string', 'null'], description: '제주 장소 이름. 사용자 현재 위치면 null.' },
+      speed: { type: 'string', enum: ['any', 'fast', 'slow'] },
+      availableOnly: { type: 'boolean', description: '지금 사용 가능하거나 빈 충전기를 요청하면 true.' },
+    },
+    required: ['place', 'speed', 'availableOnly'],
+    additionalProperties: false,
+  },
+};
+
+function parseLocation(value: unknown): Location | undefined {
+  if (!value || typeof value !== 'object' || !('lat' in value) || !('lng' in value)) return;
+  const { lat, lng } = value;
+  if (typeof lat === 'number' && typeof lng === 'number' &&
+      Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+    return { lat, lng };
+  }
 }
 
-interface Station {
-  id: string;
-  name: string;
-  address: string;
-  lat: number;
-  lng: number;
-  distance?: string;
-  chargers?: ChargerPort[];
+function getHistory(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(-6).flatMap(turn => {
+    const text = turn?.parts?.[0]?.text;
+    if (typeof text !== 'string' || !['user', 'model'].includes(turn?.role)) return [];
+    return [{ role: turn.role === 'model' ? 'assistant' : 'user', content: text.slice(0, 500) }];
+  });
 }
 
-interface ChatMessage {
-  role: 'user' | 'model';
-  parts: { text: string }[];
+function reserveRequest() {
+  const now = Date.now();
+  const currentDay = Math.floor(now / DAY_MS) * DAY_MS;
+  if (dayWindow.start !== currentDay) dayWindow = { start: currentDay, count: 0 };
+  if (now - minuteWindow.start >= MINUTE_MS) minuteWindow = { start: now, count: 0 };
+  const configured = Number(process.env.OPENAI_DAILY_REQUEST_LIMIT ?? DEFAULT_DAILY_LIMIT);
+  const dailyLimit = Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_DAILY_LIMIT;
+  const blockedUntil = Math.max(
+    dayWindow.count >= dailyLimit ? dayWindow.start + DAY_MS : 0,
+    minuteWindow.count >= REQUESTS_PER_MINUTE ? minuteWindow.start + MINUTE_MS : 0,
+  );
+  if (blockedUntil > now) return Math.ceil((blockedUntil - now) / 1000);
+
+  dayWindow.count++;
+  minuteWindow.count++;
+  return 0;
 }
 
-// 충전소 상태 요약 텍스트 생성
-function buildStationSummary(station: Station, index: number): string {
-  let summary = `${index + 1}. ${station.name}\n`;
-  summary += `   주소: ${station.address}\n`;
-  if (station.distance !== undefined) {
-    summary += `   거리: ${station.distance}km\n`;
+async function answerWithStations(req: Request, search: Search, location?: Location) {
+  let label = '현재 위치';
+  if (search.place) {
+    const url = new URL('/api/geocode', req.url);
+    url.searchParams.set('q', search.place);
+    const response = await geocode(new Request(url));
+    const place = await response.json();
+    if (!response.ok) return NextResponse.json({ reply: '장소 검색에 실패했습니다. 잠시 후 다시 시도해 주세요.' });
+    if (!place.found) return NextResponse.json({ reply: '제주에서 해당 장소를 찾지 못했습니다. 장소명이나 주소를 확인해 주세요.' });
+    location = parseLocation(place);
+    label = place.placeName;
+    if (!location) return NextResponse.json({ reply: '장소 좌표를 확인할 수 없습니다.' });
+  }
+  if (!location) return NextResponse.json({ reply: '어느 곳 주변을 찾을까요? 장소명을 입력하거나 내 위치 버튼을 눌러 주세요.' });
+
+  const url = new URL('/api/nearby', req.url);
+  url.search = new URLSearchParams({
+    lat: String(location.lat), lng: String(location.lng), radius: String(RADIUS_KM), limit: '10000',
+  }).toString();
+  const response = await nearby(new Request(url));
+  if (!response.ok) return NextResponse.json({ reply: '충전소 목록을 조회하지 못했습니다. 잠시 후 다시 시도해 주세요.' });
+  const { stations } = await response.json() as { stations: Station[] };
+
+  const candidates = stations.flatMap(station => {
+    const ports = station.chargers.filter(port => search.speed === 'any' ||
+      (search.speed === 'fast' ? isFastCharger(port.type) : port.type === '02'));
+    return ports.length ? [{ station, ports }] : [];
+  });
+  const speed = search.speed === 'fast' ? '급속 ' : search.speed === 'slow' ? '완속 ' : '';
+  if (!candidates.length) return NextResponse.json({ reply: `${label} 반경 ${RADIUS_KM}km의 지도 목록에서 ${speed}충전소를 찾지 못했습니다.` });
+
+  const dbUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const dbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!dbUrl || !dbKey) return NextResponse.json({ reply: UNKNOWN_STATUS });
+  const db = createClient(dbUrl, dbKey);
+  const statuses = new Map<string, { stat: string; updated_at: string }>();
+  const portIds = candidates.flatMap(({ station, ports }) => ports.map(port => `${station.id}_${port.chgerId}`));
+  for (let offset = 0; offset < portIds.length; offset += 100) {
+    const { data, error } = await db.from('charger_status')
+      .select('id, stat, updated_at').in('id', portIds.slice(offset, offset + 100))
+      .abortSignal(AbortSignal.timeout(5000));
+    if (error) return NextResponse.json({ reply: UNKNOWN_STATUS });
+    for (const row of data) statuses.set(row.id, row);
   }
 
-  if (station.chargers && station.chargers.length > 0) {
-    let fastTotal = 0, fastAvail = 0;
-    let slowTotal = 0, slowAvail = 0;
-    const typeSet = new Set<string>();
-
-    station.chargers.forEach((c) => {
-      const fast = isFast(c.type);
-      typeSet.add(CHARGER_TYPE_LABEL[c.type] ?? c.type);
-      if (fast) {
-        fastTotal++;
-        if (c.stat === '2') fastAvail++;
-      } else {
-        slowTotal++;
-        if (c.stat === '2') slowAvail++;
-      }
+  const cutoff = Date.now() - MAX_AGE_MS;
+  const results = candidates.map(({ station, ports }) => {
+    const recent = ports.flatMap(port => {
+      const row = statuses.get(`${station.id}_${port.chgerId}`);
+      const checkedAt = Date.parse(row?.updated_at ?? '');
+      return row && checkedAt >= cutoff && ['2', '3', '4', '5'].includes(row.stat) ? [{ ...row, checkedAt }] : [];
     });
+    return {
+      station, available: recent.filter(row => row.stat === '2').length,
+      checked: recent.length, total: ports.length,
+      oldestCheck: Math.min(...recent.map(row => row.checkedAt)),
+    };
+  });
 
-    summary += `   충전기 종류: ${[...typeSet].join(', ')}\n`;
-    if (fastTotal > 0) summary += `   급속: ${fastAvail}/${fastTotal}개 사용가능\n`;
-    if (slowTotal > 0) summary += `   완속: ${slowAvail}/${slowTotal}개 사용가능\n`;
-
-    // 충전기별 상세 상태
-    const statDetails = station.chargers
-      .map((c) => `충전기${c.chgerId}(${isFast(c.type) ? '급속' : '완속'}): ${CHARGER_STAT_LABEL[c.stat ?? '9'] ?? '미확인'}`)
-      .join(', ');
-    summary += `   상태: ${statDetails}\n`;
+  if (!results.some(result => result.checked > 0)) {
+    return NextResponse.json({ reply: `${label} 주변의 ${speed}충전소는 찾았지만 ${UNKNOWN_STATUS}` });
+  }
+  const eligible = results.filter(result => !search.availableOnly || result.available > 0);
+  if (!eligible.length) {
+    const hasUnknown = results.some(result => result.checked < result.total);
+    return NextResponse.json({
+      reply: `${label} 반경 ${RADIUS_KM}km에서 사용 가능으로 확인된 ${speed}충전기가 없습니다.${hasUnknown ? ' 일부 충전기는 현재 상태를 확인할 수 없습니다.' : ''}`,
+    });
   }
 
-  return summary;
-}
-
-// 사용자에게 보여줄 친화적 에러 메시지 변환
-function toUserFriendlyError(error: unknown): string {
-  const msg = error instanceof Error ? error.message : String(error);
-  if (msg.includes('API_KEY') || msg.includes('401') || msg.includes('403')) {
-    return 'AI 서비스 인증에 실패했습니다. 잠시 후 다시 시도해주세요.';
-  }
-  if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-    return '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.';
-  }
-  if (msg.includes('500') || msg.includes('503')) {
-    return 'AI 서비스가 일시적으로 불안정합니다. 잠시 후 다시 시도해주세요.';
-  }
-  return '응답을 처리하는 중 문제가 발생했습니다. 다시 시도해주세요.';
+  const displayed = eligible.slice(0, 5);
+  const clock = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const lines = displayed.map(({ station, available, checked, total, oldestCheck }, index) =>
+    checked === 0
+      ? `${index + 1}. **${station.name}** · 직선 ${station.distance}km · 상태 미확인`
+      : `${index + 1}. **${station.name}** · 직선 ${station.distance}km · ${speed}사용 가능 ${available}대 · ${clock.format(oldestCheck)} 이후 확인${total > checked ? ` · 미확인 ${total - checked}대` : ''}`,
+  );
+  return NextResponse.json({
+    reply: `${label} 반경 ${RADIUS_KM}km의 ${speed}충전소입니다. 확인 시각은 한국 시간입니다.\n\n${lines.join('\n')}`,
+    stations: displayed.map(({ station }) => ({
+      ...station,
+      chargers: station.chargers.map(({ chgerId, type }) => ({ chgerId, type })),
+    })),
+    stationLabel: `${label} 근처 ${speed}충전소`,
+  });
 }
 
 export async function POST(req: Request) {
-  try {
-    const { message, context, history } = await req.json() as {
-      message: string;
-      context: Station[];
-      history: ChatMessage[];
-    };
+  const body = await req.json().catch(() => null);
+  if (typeof body?.message !== 'string' || !body.message.trim() || body.message.length > 2000) {
+    return NextResponse.json({ error: '질문을 1~2,000자로 입력해 주세요.' }, { status: 400 });
+  }
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return NextResponse.json({ error: '서버에 OpenAI API 키가 설정되지 않았습니다.' }, { status: 503 });
 
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: 'AI 서비스가 준비되지 않았습니다.' },
-        { status: 500 }
-      );
-    }
-
-    const ai = new GoogleGenAI({ apiKey });
-
-    // ① systemInstruction을 config로 분리 (user role에 섞지 않음)
-    let systemInstruction = `당신은 제주도 전기차 충전소 전문 AI 어시스턴트입니다.
-
-[답변 규칙]
-1. **핵심 내용을 먼저** 1~2문장으로 간결하게 답하세요.
-2. 추가 설명이 필요한 경우에만 아래에 항목(-) 으로 나열하세요.
-3. 헤더(#, ##, ###)는 절대 사용하지 마세요.
-4. **굵은 글씨**는 핵심 키워드 강조에만 사용하세요 (과도 사용 금지).
-5. 답변은 3~6문장 이내로 짧게 유지하세요. 길어지면 핵심만 남기세요.
-6. 모르는 정보는 추측하지 말고 솔직하게 답하세요.
-7. 한국어로 친근하고 자연스럽게 대화하세요.`;
-
-
-
-    // ② 충전소 context가 있으면 상태 포함 상세 정보를 추가
-    if (context && context.length > 0) {
-      systemInstruction += `\n\n## 사용자 근처 충전소 현황 (실시간 데이터)\n`;
-      context.forEach((station, index) => {
-        systemInstruction += buildStationSummary(station, index);
-      });
-      systemInstruction += `\n위 정보를 바탕으로 사용자의 질문에 답하세요. 사용가능한 충전기가 있는 곳을 우선 추천하세요.`;
-    }
-
-    // ③ 대화 기록(history)을 그대로 전달 — 이전 대화 맥락 유지
-    const contents: ChatMessage[] = [
-      ...(history ?? []),
-      { role: 'user', parts: [{ text: message }] },
-    ];
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents,
-      config: {
-        systemInstruction,
-      },
-    });
-
-    return NextResponse.json({ reply: response.text });
-
-  } catch (error: unknown) {
-    console.error('Gemini API Error:', error);
+  const retryAfter = reserveRequest();
+  if (retryAfter) {
     return NextResponse.json(
-      { error: toUserFriendlyError(error) },
-      { status: 500 }
+      { error: '앱의 AI 사용 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.' },
+      { status: 429, headers: { 'Retry-After': String(retryAfter) } },
     );
+  }
+
+  const location = parseLocation(body.location);
+  const model = process.env.OPENAI_MODEL?.trim() || 'gpt-6-luna';
+  try {
+    const response = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(20_000),
+      body: JSON.stringify({
+        model,
+        ...(model === 'gpt-6-luna' ? { reasoning: { effort: 'none' } } : {}),
+        store: false,
+        instructions: `제주 전기차 충전 도우미로 한국어로 간단히 답합니다.
+장소나 현재 위치 주변 충전소, 사용 가능 여부, 거리, 대수를 물으면 반드시 find_chargers를 호출합니다.
+앞 문맥의 장소와 조건을 이어받되 사용자가 바꾼 조건을 우선합니다.
+명시된 장소가 없으면 place를 null로 호출합니다. GPS 사용 여부: ${location ? '있음' : '없음'}.
+실제로 조회하지 않은 충전소 상태, 대수, 현재 요금은 추측하지 않습니다. 일반 충전 지식 질문에는 직접 답합니다.`,
+        input: [...getHistory(body.history), { role: 'user', content: body.message.trim() }],
+        tools: [lookupTool],
+        parallel_tool_calls: false,
+        max_output_tokens: 320,
+      }),
+    });
+    if (!response.ok) {
+      console.error('OpenAI responses HTTP status:', response.status);
+      return NextResponse.json({
+        error: response.status === 429 ? 'AI 서비스 요청 한도 또는 사용량 설정을 확인해 주세요.' : 'AI 서비스 연결에 실패했습니다.',
+      }, { status: response.status === 429 ? 429 : 502 });
+    }
+    const data = await response.json() as { output?: ModelOutput[] };
+    const call = data.output?.find(item => item.type === 'function_call' && item.name === lookupTool.name);
+    if (call?.arguments) {
+      const search = JSON.parse(call.arguments) as Search;
+      if ((search.place === null || (typeof search.place === 'string' && search.place.length <= 120)) &&
+          ['any', 'fast', 'slow'].includes(search.speed) && typeof search.availableOnly === 'boolean') {
+        return await answerWithStations(req, search, location);
+      }
+      throw new Error('Invalid search arguments');
+    }
+
+    const reply = data.output?.flatMap(item => item.content ?? [])
+      .map(item => item.text ?? item.refusal ?? '').join('\n').trim();
+    if (!reply) throw new Error('Empty model response');
+    return NextResponse.json({ reply });
+  } catch (error) {
+    console.error('Chat request failed:', error instanceof Error ? error.name : 'UnknownError');
+    return NextResponse.json({ error: '답변을 처리하는 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.' }, { status: 502 });
   }
 }

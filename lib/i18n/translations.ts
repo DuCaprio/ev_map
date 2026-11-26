@@ -2,7 +2,7 @@ export const translations = {
   ko: {
     sidebar: {
       profile: '내 프로필',
-      login: '카카오 로그인',
+      login: '로그인',
       logout: '로그아웃',
       main: '메인 메뉴',
       map: '충전소',
